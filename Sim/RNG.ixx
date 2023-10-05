@@ -17,6 +17,7 @@ namespace RNG {
 		unsigned __int64 seed;
 		Generator();
 		double generateExponential(double lambda);
+		double generateUniform();
 		~Generator();
 	};
 
@@ -52,6 +53,19 @@ namespace RNG {
 		else {
 			std::exponential_distribution<double> expDist(lambda);
 			return expDist(*genMt19937);
+		}
+	}
+
+	double Generator::generateUniform() {
+		if (Conf::rngType == Conf::RDRAND) {
+			double x;
+			x = rdrand(); x = x / 18446744073709551615.0;
+			x = std::log(1 - x) / (-expLambda);
+			return x;
+		}
+		else {
+			std::uniform_real_distribution<> uniformDist(0, 1);
+			return uniformDist(*genMt19937);
 		}
 	}
 }

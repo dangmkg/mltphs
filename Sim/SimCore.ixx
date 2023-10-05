@@ -7,6 +7,8 @@ module;
 #include <list>
 #include <iostream>
 
+#include "Typedefs.h"
+
 export module SimCore;
 import RNG;
 
@@ -20,19 +22,20 @@ namespace SimCore {
 	/* Type definitions */
 
 	class Sim;
+	class Object;
 	class Node;
-	enum Message { arrive, done };
+	enum Message { arrive, done, gen };
 	class Packet;
 
 	class Event {
 	public:
 		double t;
-		Node* receiver;
+		Object* receiver;
 		Message action;
 		Packet* pkt;
 
 		Event();
-		static void init(Event& ev, Node* rec, Message act, double t, Packet* p);
+		static void init(Event& ev, Object* rec, Message act, double t, Packet* p);
 
 		bool operator<(const Event& Rhs) const {
 			return this->t < Rhs.t;
@@ -66,31 +69,67 @@ namespace SimCore {
 		int genId, retryCnt;
 		double creationTime, totalServTime, totalQueueTime;
 		double arriveTime;
+
+		Packet() {
+			this->totalQueueTime = 0;
+			this->totalServTime = 0;
+			this->dropped = false;
+			this->retryCnt = 0;
+			this->inSystem = false;
+			this->fromRetryQueue = false;
+		};
 	};
 	
-	class Node {
+	class Object {
 	protected:
 		Sim* sim;
 	public:
 		virtual void handle(Message msg, double t, Packet* pkt) {}
 	};
 
-	class GenNode : public Node {
+	class Node : public Object {
+
+	};
+
+	struct State {
+		std::vector<double> tIntensity;
+		std::vector<double> tFIntensity;
+		std::vector<int> tDest;
+		std::vector<bool> tType;
+		double intensity;
+	};
+
+	export void resize_Matrix(Matrix& mat, size_t m, size_t n) {
+		mat.resize(m);
+		for (size_t i = 0; i < m; i++) {
+			mat[i].resize(n);
+		}
+	}
+
+	class Flow : public Object {
 	private:
 		int id;
+		bool isMAPflow;
 
 		RNG::Generator rng;
 		double lambda;
+		Matrix d0, d1;
+		std::vector<State> states;
+		int curState;
 
 		double t;
 		Node* outNode;
 
 		double getInverval();
 	public:
-		GenNode(Sim* sim, double lambda, int id);
+		Flow(Sim* sim, double lambda, int id);
+		Flow(Sim* sim, double lambda, Matrix& d0, Matrix& d1, int id);
 		void setOutput(Node* out);
 		void generate();
 		double getTime();
+		double getLambda();
+		const Matrix& getD(int i);
+		void handle(Message msg, double t, Packet* pkt);
 	};
 
 	class SinkNode : public Node {
@@ -129,9 +168,7 @@ namespace SimCore {
 
 	export class Sim {
 	private:
-		double genMinT, genMaxT;
-
-		void generateUntil(double threshold);
+		void generate();
 		void resetStateVars(size_t limit);
 		void resetStateVars2();
 	public:
@@ -142,7 +179,7 @@ namespace SimCore {
 		
 		size_t dataCnt;
 		size_t gid;
-		std::vector<GenNode> gen;
+		std::vector<Flow> gen;
 		std::vector<BasicNode> node;
 		SinkNode* sink;
 		int nGen, nNode;
@@ -155,11 +192,11 @@ namespace SimCore {
 		size_t nPkt;
 
 		Sim();
-		void init(int n, double lambda[], double mu[], size_t queueLen[]);
-		void init2(int n, double lambda[], double mu[], size_t queueLen[]);
 		void init3(int n, double lambda, double mu[], size_t queueLen[]);
+		void init4(int n, double lambda, Matrix& d1, Matrix& d0, double mu[], size_t queueLen[]);
 		void runSim(size_t limit);
 		void runSim2(double eps);
+		void runSim3(double eps);
 		void cleanUp();
 	};
 
@@ -169,7 +206,7 @@ namespace SimCore {
 	Event::Event() {
 	}
 
-	void Event::init(Event& ev, Node* rec, Message act, double t, Packet* p) {
+	void Event::init(Event& ev, Object* rec, Message act, double t, Packet* p) {
 		ev.receiver = rec;
 		ev.action = act;
 		ev.pkt = p;
@@ -223,61 +260,150 @@ namespace SimCore {
 	}
 
 	/* ----------------------------------------------------------------------------- */
-	/* Functions of GenNode class */
+	/* Functions of Flow class */
 
-	double GenNode::getInverval() {
+	double Flow::getInverval() {
 		return this->rng.generateExponential(this->lambda);
 	}
 
-	GenNode::GenNode(Sim* sim,  double lambda, int id) {
+	Flow::Flow(Sim* sim, double lambda, int id) {
 		this->id = id;
 		this->lambda = lambda;
 		this->sim = sim;
 		this->t = 0;
+		this->isMAPflow = false;
 	}
 
-	void GenNode::setOutput(Node* out) {
+	Flow::Flow(Sim* sim, double lambda, Matrix& d0, Matrix& d1, int id) {
+		this->id = id;
+		this->lambda = lambda;
+		this->sim = sim;
+		this->t = 0;
+		this->isMAPflow = true;
+		this->curState = 0;
+
+		this->d0 = d0;
+		this->d1 = d1;
+
+		size_t i, j;
+		double sum;
+		/*
+		states.resize(d0.size());
+		for (i = 0; i < d0.size(); i++) {
+			states[i].tIntensity.clear();
+			states[i].tFIntensity.clear();
+			states[i].tDest.clear();
+			states[i].tType.clear();
+			sum = 0;
+			for (j = 0; j < d0[i].size(); j++) {
+				if (i == j) {
+					states[i].intensity = abs(d0[i][j]);
+				}
+				else if (d0[i][j] > 0) {
+					states[i].tIntensity.push_back(d0[i][j]);
+					sum = sum + d0[i][j];
+					states[i].tFIntensity.push_back(sum);
+					states[i].tDest.push_back(j);
+					states[i].tType.push_back(false);
+				}
+				if (d1[i][j] > 0) {
+					states[i].tIntensity.push_back(d1[i][j]);
+					sum = sum + d1[i][j];
+					states[i].tFIntensity.push_back(sum);
+					states[i].tDest.push_back(j);
+					states[i].tType.push_back(true);
+				}
+			}
+		}
+		*/
+		for (i = 0; i < d0.size(); i++) {
+			sum = 0;
+			for (j = 0; j < d0[i].size(); j++) {
+				sum = sum + d1[i][j];
+				if (i != j) {
+					sum = sum + d0[i][j];
+				}
+			}
+			d0[i][i] = abs(d0[i][i] - sum);
+		}
+	}
+
+	void Flow::setOutput(Node* out) {
 		this->outNode = out;
 	}
 
-	void GenNode::generate() {
-		size_t pktIdx;
-		double interval;
+	void Flow::generate() {
+		size_t pktIdx, i, iMin;
+		double interval = 0;
 		Packet* pkt;
-		Event ev;
+		Event ev, ev2;
+		bool newPacket = false;
 
-		if (this->lambda > 0.0) {
+		if (!this->isMAPflow && this->lambda > 0.0) {
 			interval = this->getInverval();
 			assert(interval >= 0);
 			this->t = this->t + interval;
-			/*
-			pktIdx = sim->gid;
-			if (pktIdx < sim->dataCnt)
-				pkt = &sim->pkt[pktIdx];
-			else {
-				pkt = &sim->tmpPkt.emplace_back();
+			newPacket = true;
+		}
+		else if (this->isMAPflow) {
+			std::vector<double> intervals;
+			intervals.resize(d0.size() * 2);
+			for (i = 0; i < d0.size(); i++) {
+				if (d0[curState][i] > 0) intervals[i * 2] = rng.generateExponential(d0[curState][i]);
+				else intervals[i * 2] = std::numeric_limits<double>::infinity();
+				if (d1[curState][i] > 0) intervals[i * 2 + 1] = rng.generateExponential(d1[curState][i]);
+				else intervals[i * 2 + 1] = std::numeric_limits<double>::infinity();
 			}
-			*/
+			iMin = 0;
+			for (i = 1; i < intervals.size(); i++) {
+				if (intervals[i] < intervals[iMin]) iMin = i;
+			}
+			interval = intervals[iMin];
+			if (interval < std::numeric_limits<double>::infinity()) {
+				assert(interval >= 0);
+				this->t = this->t + interval;
+				curState = iMin / 2;
+				newPacket = (iMin % 2 != 0);
+			}
+			else {
+				interval = 0;
+			}
+		}
+
+		if (newPacket) {
 			pkt = new Packet();
 			pkt->id = sim->gid;
 			sim->gid++;
 			sim->nPkt++;
 			pkt->genId = this->id;
 			pkt->creationTime = t;
-			pkt->totalQueueTime = 0;
-			pkt->totalServTime = 0;
-			pkt->dropped = false;
-			pkt->retryCnt = 0;
-			pkt->inSystem = false;
-			pkt->fromRetryQueue = false;
 
 			Event::init(ev, this->outNode, arrive, t, pkt);
 			sim->evList.put(ev);
 		}
+
+		if (interval > 0) {
+			Event::init(ev2, this, gen, t, nullptr);
+			sim->evList.put(ev2);
+		}
 	}
 
-	double SimCore::GenNode::getTime() {
+	double SimCore::Flow::getTime() {
 		return this->t;
+	}
+
+	double SimCore::Flow::getLambda() {
+		return this->lambda;
+	}
+
+	const Matrix& SimCore::Flow::getD(int i) {
+		if (i==0) return this->d0;
+		return this->d1;
+	}
+
+	void SimCore::Flow::handle(Message msg, double t, Packet* pkt) {
+		assert(msg == gen);
+		generate();
 	}
 
 	/* ----------------------------------------------------------------------------- */
@@ -475,27 +601,14 @@ namespace SimCore {
 		sink = nullptr;
 	}
 
-	/* POSTCONDITION: this procedure ensures all possible packets
-	   before and at threshold time have been generated */
-	void Sim::generateUntil(double threshold) {
+	void Sim::generate() {
 		int i;
 		double min = 0, max = 0;
 		double t;
 
 		for (i = 0; i < nGen; i++) {
-			while (gen[i].getTime() <= threshold) {
-				gen[i].generate();
-			}
+			gen[i].generate();
 		}
-		
-		min = gen[0].getTime(); max = min;
-		for (i = 1; i < nGen; i++) {
-			t = gen[i].getTime();
-			if (t < min) min = t;
-			else if (t > max) max = t;
-		}
-		assert(min > genMinT); genMinT = min;
-		assert(max >= genMaxT); genMaxT = max;
 	}
 
 	void Sim::resetStateVars(size_t limit)
@@ -509,48 +622,22 @@ namespace SimCore {
 		tmpPkt.clear();
 
 		gid = 0;
-		genMinT = 0;
-		genMaxT = 0;
-	}
-
-	/* Init a linear network of Poisson flow generators and nodes with exponential service time */
-	void Sim::init(int n, double lambda[], double mu[], size_t queueLen[]) {
-		int i;
-
-		nGen = n; nNode = n;
-		gen.reserve(n); node.reserve(n);
-		for (i = 0; i < n; i++) {
-			gen.emplace_back(this, lambda[i], i);
-			node.emplace_back(this, mu[i], queueLen[i]);
-		}
-		sink = new SinkNode(this);
-		for (i = n-1; i >= 0; i--) {
-			gen[i].setOutput(&node[i]);
-			if (i == n - 1) node[i].setOutput(sink);
-			else node[i].setOutput(&node[i + 1]);
-		}
 	}
 
 	void Sim::runSim(size_t limit) {
 		Event ev;
 
 		resetStateVars(limit);
-		generateUntil(0);
+		generate();
 		do {
 			evList.get(ev);
-			if (ev.t <= genMinT)
-				ev.receiver->handle(ev.action, ev.t, ev.pkt);
-			else {
-				evList.put(ev);
-				double threshold = ev.t;
-				generateUntil(threshold);	
-			}
+			ev.receiver->handle(ev.action, ev.t, ev.pkt);
 		} while (gid < limit);
 
 		/* process the remaining events */
 		while (evList.notEmpty()) {
 			evList.get(ev);
-			ev.receiver->handle(ev.action, ev.t, ev.pkt);
+			//ev.receiver->handle(ev.action, ev.t, ev.pkt);
 		}
 	}
 
@@ -561,24 +648,6 @@ namespace SimCore {
 		sink = nullptr;
 		pkt.clear(); pkt.shrink_to_fit();
 		tmpPkt.clear();
-	}
-
-	/* M/M/1/k */
-	void Sim::init2(int n, double lambda[], double mu[], size_t queueLen[]) {
-		int i;
-
-		nGen = 1; nNode = n;
-		gen.reserve(1); node.reserve(n);
-		gen.emplace_back(this, lambda[0], 0);
-		for (i = 0; i < n; i++) {
-			node.emplace_back(this, mu[i], queueLen[i]);
-		}
-		sink = new SinkNode(this);
-		gen[0].setOutput(&node[0]);
-		for (i = n - 1; i >= 0; i--) {
-			if (i == n - 1) node[i].setOutput(sink);
-			else node[i].setOutput(&node[i + 1]);
-		}
 	}
 
 	void Sim::resetStateVars2()
@@ -594,8 +663,6 @@ namespace SimCore {
 		tmpPkt.clear();
 
 		gid = 0;
-		genMinT = 0;
-		genMaxT = 0;
 
 		avgLen = 0;
 		lastTimeLenChanged = 0;
@@ -618,7 +685,7 @@ namespace SimCore {
 
 		resetStateVars2();
 		n = 0; nPktAtSink0 = 0;
-		generateUntil(0);
+		generate();
 		do {
 			evCnt++;
 			/*if ((evCnt - 1) % 1000000 == 0) {
@@ -629,13 +696,7 @@ namespace SimCore {
 				std::cout << "]\n";
 			}*/
 			evList.get(ev);
-			if (ev.t <= genMinT)
-				ev.receiver->handle(ev.action, ev.t, ev.pkt);
-			else {
-				evList.put(ev);
-				double threshold = ev.t;
-				generateUntil(threshold);
-			}
+			ev.receiver->handle(ev.action, ev.t, ev.pkt);
 			if (nPktAtSink > n) {
 				/*if (stage == 0) {
 					len[cnt] = avgLen / lastTimeLenChanged;
@@ -685,22 +746,78 @@ namespace SimCore {
 					}
 					eps = sumDelta / sumW;
 					cnt = 0;
-					std::cout << W[0] << "\n";
+					//std::cout << W[0] << "\n";
 				}
 				//std::cout << "Eps: " << eps << "\n";
 				n = nPktAtSink;
-				//std::cout << W[0] << "\n";
+				// std::cout << W[0] << "\n";
 			}
 		} while (nPktAtSink - nPktAtSink0 <= WINDOW_SIZE || eps > epsTarget);
 
 		avgTimeInSys = W[0];
 
-		/* process the remaining events */
+		/* clear the remaining events */
 		while (evList.notEmpty()) {
 			evList.get(ev);
-			ev.receiver->handle(ev.action, ev.t, ev.pkt);
 		}
-		//avgTimeInSys = totalTimeInSys / nPktAtSink;
+	}
+
+	void Sim::runSim3(double epsTarget) {
+		Event ev;
+		double W[WINDOW_SIZE];
+		double len[WINDOW_SIZE];
+		double delta[WINDOW_SIZE];
+		double eps = 1;
+		double epsLambda = 1;
+		int cnt = 0;
+		double nPktAtSink0, n, t, lambda;
+		double totalTimeInSys0 = 0;
+		size_t evCnt = 0;
+
+		resetStateVars2();
+		n = 0; nPktAtSink0 = 0;
+		generate();
+		do {
+			evCnt++;
+			evList.get(ev);
+			t = ev.t;
+			ev.receiver->handle(ev.action, ev.t, ev.pkt);
+			if (nPktAtSink > n) {
+				W[cnt] = (totalTimeInSys - totalTimeInSys0) / (nPktAtSink - nPktAtSink0);
+				if (cnt > 0) {
+					delta[cnt] = abs(W[cnt] - W[0]);
+				}
+				else {
+					delta[cnt] = 0;
+				}
+				cnt++;
+				if (cnt == WINDOW_SIZE) {
+					int i;
+					double sumW, sumDelta;
+					sumW = 0;
+					sumDelta = 0;
+					for (i = 0; i < WINDOW_SIZE; i++) {
+						sumW = sumW + W[i];
+						sumDelta = sumDelta + delta[i];
+					}
+					eps = sumDelta / sumW;
+					lambda = gen[0].getLambda();
+					epsLambda = abs(lambda - (double)nPkt / t) / lambda;
+					cnt = 0;
+					//std::cout << W[0] << "\n";
+					//std::cout << lambda << " " << (double)nPkt / t << "\n";
+				}
+				//std::cout << "Eps: " << eps << "\n";
+				n = nPktAtSink;
+			}
+		} while (nPktAtSink - nPktAtSink0 <= WINDOW_SIZE || eps > epsTarget || epsLambda > epsTarget);
+
+		avgTimeInSys = W[0];
+
+		/* clear the remaining events */
+		while (evList.notEmpty()) {
+			evList.get(ev);
+		}
 	}
 
 	void Sim::init3(int n, double lambda, double mu[], size_t queueLen[]) {
@@ -723,199 +840,23 @@ namespace SimCore {
 		node[0].isRetryQueue = true;
 	}
 
-	class StateSimEvent {
-	public:
-		int sender, recv;
-		double time;
-		int msg;
-		#define MSG_NEW 1
-		#define MSG_DEL 0
-
-		bool operator<(const StateSimEvent& Rhs) const {
-			return this->time < Rhs.time;
-		}
-
-		bool operator>(const StateSimEvent& Rhs) const {
-			return this->time > Rhs.time;
-		}
-
-		bool operator==(const StateSimEvent& Rhs) const {
-			return this->time == Rhs.time;
-		}
-	};
-
-	export class StateSimMM1k {
-	private:
-		size_t stepCnt;
-		size_t pktId;
-		std::vector<StateSimEvent> evQueue;
-		std::vector<size_t> state;
-		double t, time;
-		RNG::Generator rand;
-
-		size_t genIdx(int senderId) {
-			assert(senderId < 0);
-			return -senderId - 1;
-		};
-		int senderId(size_t idx, bool isGenIdx) {
-			if (isGenIdx) {
-				assert(idx < -INT_MIN);
-				return -(int)idx - 1;
-			}
-			else {
-				return idx;
-			}
-		};
-
-		void gen(size_t idx);
-		void serv(size_t idx);
-		void doStep();
-	public:
-		int nNodes;
-		std::vector<double> lambda, mu;
-		std::vector<size_t> k;
-		std::vector<int> outNodeL, outNodeM;
-		std::vector<double> Pi;
-		std::vector<size_t> nPkt, nPktDrop;
-
-		size_t stateIdx(const std::vector<size_t>& state, const std::vector<size_t>& k) {
-			size_t idx = state[0];
-			size_t arrSize = 1;
-			for (size_t i = 1; i < state.size(); i++) {
-				arrSize = arrSize * k[i - 1];
-				idx = idx + state[i] * arrSize;
-			}
-			return idx;
-		};
-
-		void init(std::vector<double>& lambda0, std::vector<double>& mu0, std::vector<size_t>& k0);
-		void runSteps(size_t maxStep);
-		void runEps(double eps, std::vector<double> L0);
-	};
-
-	void StateSimMM1k::init(std::vector<double>& lambda0, std::vector<double>& mu0, std::vector<size_t>& k0) {
-		lambda = lambda0;
-		mu = mu0;
-		k = k0;
-
-		assert(lambda.size() == mu.size());
-		assert(lambda.size() == k.size());
-
-		size_t i;
-		size_t nStates = 1;
-		for (i = 0; i < k0.size(); i++) nStates = nStates * k0[i];
-		Pi.resize(nStates);
-		nPkt.resize(mu.size());
-		nPktDrop.resize(mu.size());
-		state.resize(mu.size());
-
-		outNodeL.resize(lambda.size());
-		for (i = 0; i < lambda.size(); i++) {
-			outNodeL[i] = i;
-		}
-		outNodeM.resize(mu.size());
-		for (i = 0; i < mu.size(); i++) {
-			outNodeM[i] = i + 1;
-		}
-		outNodeM[mu.size() - 1] = -1; // sink
-	}
-
-	void StateSimMM1k::gen(size_t idx) {
-		double interval, evTime;
-		if (this->lambda[idx] > 0) {
-			interval = rand.generateExponential(this->lambda[idx]);
-			StateSimEvent ev;
-			ev.msg = MSG_NEW;
-			ev.time = this->time + interval;
-			ev.sender = senderId(idx, true);
-			ev.recv = senderId(this->outNodeL[idx], false);
-
-			evQueue.push_back(ev);
-			std::push_heap(evQueue.begin(), evQueue.end(), std::greater<>{});
-		}
-	}
-
-	void StateSimMM1k::serv(size_t idx) {
-		double interval, evTime;
-		if (this->mu[idx] > 0) {
-			interval = rand.generateExponential(this->lambda[idx]);
-			StateSimEvent ev;
-			ev.msg = MSG_DEL;
-			ev.time = this->time + interval;
-			ev.sender = senderId(idx, false);
-			ev.recv = senderId(idx, false);
-
-			evQueue.push_back(ev);
-			std::push_heap(evQueue.begin(), evQueue.end(), std::greater<>{});
-		}
-	}
-
-	void StateSimMM1k::doStep() {
+	void Sim::init4(int n, double lambda, Matrix& d0, Matrix& d1, double mu[], size_t queueLen[]) {
 		int i;
 
-		stepCnt++;
-		StateSimEvent ev = evQueue[0];
-		std::pop_heap(evQueue.begin(), evQueue.end(), std::greater<>{});
-		evQueue.pop_back();
-
-		i = ev.recv;
-		this->time = ev.time;
-		if (ev.msg == MSG_NEW) {
-			this->nPkt[i]++;
-			if (ev.sender < 0) {
-				this->gen(genIdx(ev.sender));
-				pktId++;
-			}
-			if (this->state[i] == this->k[i] - 1) {
-				this->nPktDrop[i]++;
-			}
-			else {
-				double interval = ev.time - this->t;
-				this->t = ev.time;
-				size_t st = stateIdx(this->state, this->k);
-				this->Pi[st] = this->Pi[st] + interval;
-				if (this->state[i] == 0) this->serv(i);
-				state[i]++;
-			}
+		nGen = 1; nNode = n;
+		gen.reserve(1); node.reserve(n);
+		gen.emplace_back(this, lambda, d0, d1, 0);
+		for (i = 0; i < n; i++) {
+			node.emplace_back(this, mu[i], queueLen[i]);
 		}
-		else if (ev.msg == MSG_DEL) {
-			double interval = ev.time - this->t;
-			this->t = ev.time;
-			size_t st = stateIdx(this->state, this->k);
-			this->Pi[st] = this->Pi[st] + interval;
-			state[i]--;
-			if (this->state[i] > 0) this->serv(i);
-			if (this->outNodeM[i] >= 0) {
-				StateSimEvent newEv;
-				newEv.recv = senderId(this->outNodeM[i], false);
-				newEv.sender = i;
-				newEv.time = ev.time;
-				newEv.msg = MSG_NEW;
-				evQueue.push_back(newEv);
-				std::push_heap(evQueue.begin(), evQueue.end(), std::greater<>{});
-			}
+		sink = new SinkNode(this);
+		gen[0].setOutput(&node[1]);
+		for (i = n - 1; i >= 1; i--) {
+			if (i == n - 1) node[i].setOutput(sink);
+			else node[i].setOutput(&node[i + 1]);
+			node[i].setRetryQueue(&node[0]);
 		}
-	}
-
-	void StateSimMM1k::runSteps(size_t maxStep) {
-		size_t i;
-
-		std::fill(Pi.begin(), Pi.end(), 0);
-		std::fill(nPkt.begin(), nPkt.end(), 0);
-		std::fill(nPktDrop.begin(), nPktDrop.end(), 0);
-		std::fill(state.begin(), state.end(), 0);
-		stepCnt = 0;
-		pktId = 0;
-		t = 0;
-		evQueue.clear();
-
-		for (i = 0; i < lambda.size(); i++) gen(i);
-		for (i = 0; i < maxStep; i++) {
-			doStep();
-		}
-	}
-
-	void StateSimMM1k::runEps(double eps, std::vector<double> L0) {
-		std::fill(Pi.begin(), Pi.end(), 0);
+		node[0].setOutput(&node[1]);
+		node[0].isRetryQueue = true;
 	}
 }
